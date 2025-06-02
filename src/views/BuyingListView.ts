@@ -35,6 +35,8 @@ export class BuyingListView extends ItemView {
 	private currentSort: ItemSortOptions = { field: "order", direction: "asc" };
 	private selectedCategory: string | null = null;
 	private searchTerm: string = "";
+	private isRefreshing: boolean = false;
+	private refreshingItems: Set<string> = new Set();
 
 	constructor(leaf: WorkspaceLeaf, plugin: BuyingListPlugin) {
 		super(leaf);
@@ -99,14 +101,21 @@ export class BuyingListView extends ItemView {
 		// Add item button
 		const addButton = actionsSection.createEl("button", {
 			text: "+ إضافة عنصر",
-			cls: "mod-cta",
+			cls: "btn btn-primary",
 		});
 		addButton.onclick = () => this.openAddItemModal();
+
+		// Global refresh all prices button
+		const globalRefreshButton = actionsSection.createEl("button", {
+			text: "🔄 تحديث جميع الأسعار",
+			cls: "btn btn-success global-refresh-btn",
+		});
+		globalRefreshButton.onclick = () => this.refreshAllPrices();
 
 		// Settings button
 		const settingsButton = actionsSection.createEl("button", {
 			text: "⚙️ الإعدادات",
-			cls: "settings-button",
+			cls: "btn btn-secondary",
 		});
 		settingsButton.onclick = () => this.openSettingsModal();
 
@@ -347,6 +356,16 @@ export class BuyingListView extends ItemView {
 		statsDiv.createEl("div", {
 			text: `تم الشراء: ${statusCounts.purchased}`,
 		});
+
+		// Add refresh status if currently refreshing
+		if (this.isRefreshing) {
+			const refreshStatus = statsDiv.createEl("div", {
+				text: "🔄 جاري تحديث الأسعار...",
+				cls: "refresh-status",
+			});
+			refreshStatus.style.color = "var(--interactive-accent)";
+			refreshStatus.style.fontWeight = "600";
+		}
 	}
 
 	private updateItemsList(container?: HTMLElement): void {
@@ -372,9 +391,16 @@ export class BuyingListView extends ItemView {
 		);
 
 		if (items.length === 0) {
-			container.createDiv("empty-state").createEl("p", {
+			const emptyState = container.createDiv("empty-state");
+			emptyState.createDiv("empty-state-icon").setText("🛍️");
+			emptyState.createEl("p", {
 				text: "لا توجد عناصر لعرضها",
 			});
+			const addFirstItemBtn = emptyState.createEl("button", {
+				text: "إضافة أول عنصر",
+				cls: "btn btn-primary",
+			});
+			addFirstItemBtn.onclick = () => this.openAddItemModal();
 			return;
 		}
 
@@ -413,11 +439,6 @@ export class BuyingListView extends ItemView {
 		}
 
 		// Priority indicator
-		const priorityColors = {
-			high: "#ef4444",
-			medium: "#f59e0b",
-			low: "#10b981",
-		};
 		const priorityTexts = {
 			high: "عالية",
 			medium: "متوسطة",
@@ -431,10 +452,26 @@ export class BuyingListView extends ItemView {
 		// Item actions
 		const itemActions = itemHeader.createDiv("item-actions");
 
+		// Refresh all prices for this item button
+		const refreshItemButton = itemActions.createEl("button", {
+			text: "🔄 تحديث الأسعار",
+			cls: "btn btn-success refresh-all-prices-btn",
+		});
+
+		const isItemRefreshing = this.refreshingItems.has(item.id);
+		if (isItemRefreshing) {
+			refreshItemButton.addClass("btn-loading");
+			refreshItemButton.disabled = true;
+			refreshItemButton.textContent = "جاري التحديث...";
+		}
+
+		refreshItemButton.onclick = () => this.refreshItemPrices(item.id);
+
 		// Edit button
 		const editButton = itemActions.createEl("button", {
 			text: "✏️",
 			cls: "item-action-btn",
+			attr: { title: "تعديل العنصر" },
 		});
 		editButton.onclick = () => this.openEditItemModal(item);
 
@@ -442,6 +479,7 @@ export class BuyingListView extends ItemView {
 		const deleteButton = itemActions.createEl("button", {
 			text: "🗑️",
 			cls: "item-action-btn",
+			attr: { title: "حذف العنصر" },
 		});
 		deleteButton.onclick = () => this.deleteItem(item.id);
 
@@ -470,6 +508,14 @@ export class BuyingListView extends ItemView {
 			this.createPriceComparisonSection(itemBody, priceComparison);
 		}
 
+		// Buying recommendation
+		const recommendation = this.plugin.priceService.getBuyingRecommendation(
+			item.id
+		);
+		if (recommendation && item.websites.length > 0) {
+			this.createRecommendationSection(itemBody, recommendation);
+		}
+
 		// Tags
 		if (item.tags.length > 0) {
 			const tagsSection = itemBody.createDiv("item-tags");
@@ -493,7 +539,9 @@ export class BuyingListView extends ItemView {
 		const websitesHeader = container.createDiv("websites-header");
 		websitesHeader.createEl("h4", { text: "المواقع والأسعار" });
 
-		const addWebsiteButton = websitesHeader.createEl("button", {
+		const headerActions = websitesHeader.createDiv("header-actions");
+
+		const addWebsiteButton = headerActions.createEl("button", {
 			text: "+ موقع",
 			cls: "add-website-btn",
 		});
@@ -504,11 +552,17 @@ export class BuyingListView extends ItemView {
 		item.websites.forEach((website) => {
 			const websiteItem = websitesList.createDiv("website-item");
 
-			// Website name and URL
+			// Website info
 			const websiteInfo = websiteItem.createDiv("website-info");
 			websiteInfo.createEl("span", {
 				text: website.name,
 				cls: "website-name",
+			});
+
+			// Add URL preview
+			const urlPreview = websiteInfo.createEl("div", {
+				text: this.truncateUrl(website.url),
+				cls: "website-url",
 			});
 
 			// Price
@@ -523,7 +577,13 @@ export class BuyingListView extends ItemView {
 				if (website.lastUpdated) {
 					const lastUpdated = new Date(
 						website.lastUpdated
-					).toLocaleDateString("ar-SA");
+					).toLocaleDateString("ar-SA", {
+						year: "numeric",
+						month: "short",
+						day: "numeric",
+						hour: "2-digit",
+						minute: "2-digit",
+					});
 					priceSection.createEl("span", {
 						text: `آخر تحديث: ${lastUpdated}`,
 						cls: "last-updated",
@@ -542,19 +602,29 @@ export class BuyingListView extends ItemView {
 			// View website button (embed)
 			const viewButton = websiteActions.createEl("button", {
 				text: "👁️",
+				attr: { title: "عرض الموقع" },
 			});
 			viewButton.onclick = () => this.openWebsiteEmbed(website);
 
 			// Update price button
 			const updateButton = websiteActions.createEl("button", {
 				text: "🔄",
+				attr: { title: "تحديث السعر" },
 			});
 			updateButton.onclick = () =>
 				this.updateWebsitePrice(item.id, website.id);
 
+			// Open in browser button
+			const openButton = websiteActions.createEl("button", {
+				text: "🔗",
+				attr: { title: "فتح في متصفح جديد" },
+			});
+			openButton.onclick = () => window.open(website.url, "_blank");
+
 			// Remove website button
 			const removeButton = websiteActions.createEl("button", {
 				text: "❌",
+				attr: { title: "إزالة الموقع" },
 			});
 			removeButton.onclick = () =>
 				this.removeWebsite(item.id, website.id);
@@ -578,11 +648,85 @@ export class BuyingListView extends ItemView {
 					cls: "savings-info",
 				});
 			}
+
+			// Create comparison table
+			const comparisonTable =
+				comparisonSection.createDiv("comparison-table");
+			comparison.websites.forEach((website: any, index: number) => {
+				const row = comparisonTable.createDiv("comparison-row");
+
+				if (index === 0) {
+					row.addClass("best-price");
+				}
+
+				row.createEl("span", {
+					text: website.name,
+					cls: "website-name-comp",
+				});
+
+				row.createEl("span", {
+					text: `${website.price} ${website.currency}`,
+					cls: "website-price-comp",
+				});
+
+				if (index === 0) {
+					row.createEl("span", {
+						text: "🏆 أفضل سعر",
+						cls: "best-price-badge",
+					});
+				}
+			});
 		}
 
 		// Price chart
 		const chartContainer = comparisonSection.createDiv("price-chart");
 		this.createPriceChart(chartContainer, comparison.itemId);
+	}
+
+	private createRecommendationSection(
+		container: HTMLElement,
+		recommendation: any
+	): void {
+		const recSection = container.createDiv("recommendation-section");
+		recSection.createEl("h4", { text: "توصية الشراء" });
+
+		const recCard = recSection.createDiv(
+			`recommendation-card rec-${recommendation.recommendation}`
+		);
+
+		const recIcon = {
+			buy: "✅",
+			wait: "⏳",
+			uncertain: "❓",
+		}[recommendation.recommendation as "buy" | "wait" | "uncertain"];
+
+		const recText = {
+			buy: "ينصح بالشراء الآن",
+			wait: "انتظر لسعر أفضل",
+			uncertain: "غير محدد",
+		}[recommendation.recommendation as "buy" | "wait" | "uncertain"];
+
+		recCard.createEl("div", {
+			text: `${recIcon} ${recText}`,
+			cls: "recommendation-title",
+		});
+
+		recCard.createEl("div", {
+			text: recommendation.reason,
+			cls: "recommendation-reason",
+		});
+
+		recCard.createEl("div", {
+			text: `مستوى الثقة: ${recommendation.confidence}%`,
+			cls: "recommendation-confidence",
+		});
+
+		if (recommendation.bestWebsite) {
+			recCard.createEl("div", {
+				text: `أفضل موقع: ${recommendation.bestWebsite}`,
+				cls: "recommendation-website",
+			});
+		}
 	}
 
 	private createPriceChart(container: HTMLElement, itemId: string): void {
@@ -596,6 +740,7 @@ export class BuyingListView extends ItemView {
 		if (priceHistory.length < 2) {
 			container.createEl("p", {
 				text: "بيانات غير كافية لعرض الرسم البياني",
+				cls: "chart-no-data",
 			});
 			return;
 		}
@@ -630,13 +775,148 @@ export class BuyingListView extends ItemView {
 		);
 		polyline.setAttribute("points", points);
 		polyline.setAttribute("fill", "none");
-		polyline.setAttribute("stroke", "#3b82f6");
+		polyline.setAttribute("stroke", "#667eea");
 		polyline.setAttribute("stroke-width", "2");
 
 		svg.appendChild(polyline);
+		container.appendChild(svg);
 	}
 
-	// Modal functions will be implemented in the next part...
+	private truncateUrl(url: string): string {
+		try {
+			const urlObj = new URL(url);
+			const hostname = urlObj.hostname;
+			if (hostname.length > 30) {
+				return hostname.substring(0, 27) + "...";
+			}
+			return hostname;
+		} catch {
+			return url.length > 30 ? url.substring(0, 27) + "..." : url;
+		}
+	}
+
+	// Enhanced refresh functionality
+	private async refreshAllPrices(): Promise<void> {
+		if (this.isRefreshing) {
+			new Notice("تحديث الأسعار قيد التقدم بالفعل");
+			return;
+		}
+
+		this.isRefreshing = true;
+
+		// Update UI to show refreshing state
+		const globalRefreshBtn = this.contentEl.querySelector(
+			".global-refresh-btn"
+		) as HTMLButtonElement;
+		if (globalRefreshBtn) {
+			globalRefreshBtn.addClass("refreshing");
+			globalRefreshBtn.textContent = "🔄 جاري التحديث...";
+			globalRefreshBtn.disabled = true;
+		}
+
+		const notice = new Notice("بدء تحديث جميع الأسعار...", 0);
+
+		try {
+			await this.plugin.priceService.updateAllPrices();
+			notice.hide();
+			new Notice("تم تحديث جميع الأسعار بنجاح");
+
+			// Refresh the view
+			this.updateItemsList();
+			this.updateStatistics(
+				this.contentEl.querySelector(
+					".sidebar-section:nth-child(2)"
+				) as HTMLElement
+			);
+		} catch (error) {
+			notice.hide();
+			new Notice("حدث خطأ أثناء تحديث الأسعار");
+			console.error("Error refreshing all prices:", error);
+		} finally {
+			this.isRefreshing = false;
+
+			// Reset button state
+			if (globalRefreshBtn) {
+				globalRefreshBtn.removeClass("refreshing");
+				globalRefreshBtn.textContent = "🔄 تحديث جميع الأسعار";
+				globalRefreshBtn.disabled = false;
+			}
+		}
+	}
+
+	private async refreshItemPrices(itemId: string): Promise<void> {
+		if (this.refreshingItems.has(itemId)) {
+			return;
+		}
+
+		const item = this.plugin.dataService.getItemById(itemId);
+		if (!item || item.websites.length === 0) {
+			new Notice("لا توجد مواقع لتحديث أسعارها");
+			return;
+		}
+
+		this.refreshingItems.add(itemId);
+
+		// Update UI to show loading state
+		this.updateItemsList();
+
+		const notice = new Notice(`جاري تحديث أسعار: ${item.name}...`, 0);
+
+		try {
+			const updatePromises = item.websites
+				.filter((website) => website.isActive)
+				.map((website) =>
+					this.plugin.priceService.updateWebsitePrice(
+						item.id,
+						website.id
+					)
+				);
+
+			const results = await Promise.allSettled(updatePromises);
+
+			let successCount = 0;
+			let errorCount = 0;
+
+			results.forEach((result) => {
+				if (result.status === "fulfilled" && result.value.success) {
+					successCount++;
+				} else {
+					errorCount++;
+				}
+			});
+
+			notice.hide();
+
+			if (successCount > 0) {
+				new Notice(
+					`تم تحديث ${successCount} من ${item.websites.length} أسعار بنجاح`
+				);
+			}
+
+			if (errorCount > 0) {
+				new Notice(`فشل في تحديث ${errorCount} أسعار`);
+			}
+
+			// Refresh the view
+			this.updateItemsList();
+			this.updateStatistics(
+				this.contentEl.querySelector(
+					".sidebar-section:nth-child(2)"
+				) as HTMLElement
+			);
+		} catch (error) {
+			notice.hide();
+			new Notice(`حدث خطأ أثناء تحديث أسعار: ${item.name}`);
+			console.error("Error refreshing item prices:", error);
+		} finally {
+			this.refreshingItems.delete(itemId);
+
+			// Update UI to remove loading state
+			this.updateItemsList();
+		}
+	}
+
+	// Modal functions
 	private openAddItemModal(): void {
 		new AddItemModal(this.app, this.plugin, (item) => {
 			this.plugin.dataService.addItem(item).then(() => {
@@ -717,15 +997,24 @@ export class BuyingListView extends ItemView {
 		const item = this.plugin.dataService.getItemById(itemId);
 		if (!item) return;
 
-		item.websites = item.websites.filter((w) => w.id !== websiteId);
-		await this.plugin.dataService.updateItem(itemId, {
-			websites: item.websites,
-		});
-		this.updateItemsList();
+		const website = item.websites.find((w) => w.id === websiteId);
+		const websiteName = website?.name || "الموقع";
+
+		if (confirm(`هل أنت متأكد من إزالة موقع "${websiteName}"؟`)) {
+			item.websites = item.websites.filter((w) => w.id !== websiteId);
+			await this.plugin.dataService.updateItem(itemId, {
+				websites: item.websites,
+			});
+			this.updateItemsList();
+			new Notice(`تم إزالة موقع "${websiteName}"`);
+		}
 	}
 
 	private async deleteItem(itemId: string): Promise<void> {
-		if (confirm("هل أنت متأكد من حذف هذا العنصر؟")) {
+		const item = this.plugin.dataService.getItemById(itemId);
+		const itemName = item?.name || "العنصر";
+
+		if (confirm(`هل أنت متأكد من حذف "${itemName}"؟`)) {
 			await this.plugin.dataService.deleteItem(itemId);
 			this.updateItemsList();
 			this.updateStatistics(
@@ -733,15 +1022,20 @@ export class BuyingListView extends ItemView {
 					".sidebar-section:nth-child(2)"
 				) as HTMLElement
 			);
+			new Notice(`تم حذف "${itemName}"`);
 		}
 	}
 
 	private async deleteCategory(categoryId: string): Promise<void> {
-		await this.plugin.dataService.deleteCategory(categoryId);
-		this.updateCategoriesList(
-			this.contentEl.querySelector(".categories-list") as HTMLElement
-		);
+		const category = this.plugin.dataService.getCategoryById(categoryId);
+		const categoryName = category?.name || "الفئة";
+
+		if (confirm(`هل أنت متأكد من حذف فئة "${categoryName}"؟`)) {
+			await this.plugin.dataService.deleteCategory(categoryId);
+			this.updateCategoriesList(
+				this.contentEl.querySelector(".categories-list") as HTMLElement
+			);
+			new Notice(`تم حذف فئة "${categoryName}"`);
+		}
 	}
 }
-
-// Modal classes will be defined in separate files...
