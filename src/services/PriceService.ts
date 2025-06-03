@@ -12,6 +12,8 @@ export interface PriceUpdateResult {
 	success: boolean;
 	price?: number;
 	error?: string;
+	extractedText?: string; // For debugging
+	usedSelector?: string; // For debugging
 }
 
 export interface PriceComparisonResult {
@@ -36,6 +38,65 @@ export class PriceService {
 	private dataService: DataService;
 	private priceUpdateInterval: NodeJS.Timer | null = null;
 	private isMonitoring = false;
+
+	// Enhanced price extraction patterns
+	private readonly PRICE_PATTERNS = [
+		// Standard decimal formats
+		/\d{1,3}(?:[,\s]\d{3})*\.\d{2}/g,
+		// Arabic decimal separator
+		/\d{1,3}(?:[,\s]\d{3})*٫\d{2}/g,
+		// Comma as decimal (European style)
+		/\d{1,3}(?:[\.\s]\d{3})*,\d{2}/g,
+		// Integer with thousands separators
+		/\d{1,3}(?:[,\s.]\d{3})+/g,
+		// Simple decimals
+		/\d+[\.\,٫]\d{1,2}/g,
+		// Large integers (3+ digits)
+		/\d{4,}/g,
+		// Any number sequence
+		/\d+/g,
+	];
+
+	// Common price-related attributes to check
+	private readonly PRICE_ATTRIBUTES = [
+		"data-price",
+		"data-amount",
+		"data-value",
+		"data-cost",
+		"content",
+		"value",
+		"title",
+		"aria-label",
+		"data-original-price",
+		"data-sale-price",
+		"data-currency-amount",
+	];
+
+	// Currency symbols and their variations
+	private readonly CURRENCY_PATTERNS = {
+		"ر.س": [/ر\.س/g, /ريال/g, /رس/g, /SAR/gi, /SR/gi],
+		$: [/\$/g, /USD/gi, /دولار/g, /dollar/gi],
+		"€": [/€/g, /EUR/gi, /يورو/g, /euro/gi],
+		"£": [/£/g, /GBP/gi, /جنيه/g, /pound/gi],
+		"د.إ": [/د\.إ/g, /درهم/g, /AED/gi, /dirham/gi],
+		"ج.م": [/ج\.م/g, /جنيه\s*مصري/g, /EGP/gi],
+		"د.ك": [/د\.ك/g, /دينار/g, /KWD/gi, /dinar/gi],
+		"ل.ل": [/ل\.ل/g, /ليرة/g, /LBP/gi, /lira/gi],
+	};
+
+	// Arabic to Western numeral mapping
+	private readonly ARABIC_NUMERALS = {
+		"٠": "0",
+		"١": "1",
+		"٢": "2",
+		"٣": "3",
+		"٤": "4",
+		"٥": "5",
+		"٦": "6",
+		"٧": "7",
+		"٨": "8",
+		"٩": "9",
+	};
 
 	constructor(app: App, plugin: Plugin) {
 		this.app = app;
@@ -102,17 +163,21 @@ export class PriceService {
 		}
 
 		try {
-			const price = await this.scrapePrice(website);
+			const extractionResult = await this.scrapePrice(website);
 
-			if (price !== null && price !== website.currentPrice) {
+			if (
+				extractionResult.success &&
+				extractionResult.price !== null &&
+				extractionResult.price !== website.currentPrice
+			) {
 				// Update website price
-				website.currentPrice = price;
+				website.currentPrice = extractionResult.price;
 				website.lastUpdated = Date.now();
 
 				// Add to price history
 				const priceHistoryEntry: PriceHistory = {
 					timestamp: Date.now(),
-					price: price,
+					price: extractionResult.price,
 					websiteId: websiteId,
 				};
 				item.priceHistory.push(priceHistoryEntry);
@@ -128,7 +193,11 @@ export class PriceService {
 					);
 
 				// Check for price alerts
-				await this.checkPriceAlerts(item, website, price);
+				await this.checkPriceAlerts(
+					item,
+					website,
+					extractionResult.price
+				);
 
 				// Update item
 				await this.dataService.updateItem(itemId, {
@@ -136,10 +205,23 @@ export class PriceService {
 					priceHistory: item.priceHistory,
 				});
 
-				return { websiteId, success: true, price };
+				return {
+					websiteId,
+					success: true,
+					price: extractionResult.price,
+					extractedText: extractionResult.extractedText,
+					usedSelector: extractionResult.usedSelector,
+				};
 			}
 
-			return { websiteId, success: true, price: website.currentPrice };
+			return {
+				websiteId,
+				success: extractionResult.success,
+				price: website.currentPrice,
+				error: extractionResult.error,
+				extractedText: extractionResult.extractedText,
+				usedSelector: extractionResult.usedSelector,
+			};
 		} catch (error) {
 			console.error(`Failed to update price for ${website.name}:`, error);
 			return {
@@ -150,274 +232,558 @@ export class PriceService {
 		}
 	}
 
-	private async scrapePrice(website: Website): Promise<number | null> {
+	private async scrapePrice(website: Website): Promise<{
+		success: boolean;
+		price: number | null;
+		error?: string;
+		extractedText?: string;
+		usedSelector?: string;
+	}> {
 		try {
-			// Use Obsidian's requestUrl for web scraping
+			// Enhanced request headers to avoid blocking
 			const response = await requestUrl({
 				url: website.url,
 				method: "GET",
 				headers: {
-					"User-Agent":
-						"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+					"User-Agent": this.getRandomUserAgent(),
+					Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+					"Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
+					"Accept-Encoding": "gzip, deflate",
+					Connection: "keep-alive",
+					"Upgrade-Insecure-Requests": "1",
+					"Sec-Fetch-Dest": "document",
+					"Sec-Fetch-Mode": "navigate",
+					"Sec-Fetch-Site": "none",
+					"Cache-Control": "max-age=0",
 				},
 			});
 
-			const html = response.text;
-
-			// Try each selector until one works
-			for (const selector of website.priceSelector) {
-				const price = this.extractPriceFromHtml(html, selector);
-				if (price !== null) {
-					return price;
-				}
+			if (response.status !== 200) {
+				return {
+					success: false,
+					price: null,
+					error: `HTTP ${response.status}: ${
+						response.text || "Unable to fetch page"
+					}`,
+				};
 			}
 
-			return null;
+			const html = response.text;
+			if (!html || html.length < 100) {
+				return {
+					success: false,
+					price: null,
+					error: "صفحة فارغة أو محتوى غير صحيح",
+				};
+			}
+
+			// Try enhanced price extraction
+			const extractionResult = this.extractPriceFromHtml(
+				html,
+				website.priceSelector
+			);
+
+			return extractionResult;
 		} catch (error) {
 			console.error(`Error scraping price from ${website.url}:`, error);
-			return null;
+			return {
+				success: false,
+				price: null,
+				error: `خطأ في الشبكة: ${
+					error instanceof Error ? error.message : "خطأ غير معروف"
+				}`,
+			};
 		}
 	}
 
 	private extractPriceFromHtml(
 		html: string,
-		selector: string
-	): number | null {
+		selectors: string[]
+	): {
+		success: boolean;
+		price: number | null;
+		error?: string;
+		extractedText?: string;
+		usedSelector?: string;
+	} {
 		try {
-			// Create a temporary DOM parser
+			// Create DOM parser
 			const parser = new DOMParser();
 			const doc = parser.parseFromString(html, "text/html");
 
-			// Try to find element by selector with multiple methods
-			let element: Element | null = null;
+			// Remove script and style elements that might contain false prices
+			const scriptsAndStyles = doc.querySelectorAll(
+				"script, style, noscript"
+			);
+			scriptsAndStyles.forEach((element) => element.remove());
 
-			// Try CSS selector first (most reliable)
-			try {
-				element = doc.querySelector(selector);
-			} catch (e) {
-				// Fallback to basic selectors if CSS selector fails
-				if (selector.startsWith("#")) {
-					element = doc.getElementById(selector.slice(1));
-				} else if (selector.startsWith(".")) {
-					const elements = doc.getElementsByClassName(
-						selector.slice(1)
-					);
-					element = elements.length > 0 ? elements[0] : null;
-				} else {
-					const elements = doc.getElementsByTagName(selector);
-					element = elements.length > 0 ? elements[0] : null;
+			// Try each provided selector first
+			for (const selector of selectors) {
+				const result = this.tryExtractWithSelector(doc, selector);
+				if (result.success && result.price !== null) {
+					return {
+						...result,
+						usedSelector: selector,
+					};
 				}
 			}
 
-			if (!element) return null;
+			// If no selectors worked, try common price selectors
+			const commonSelectors = this.getCommonPriceSelectors();
+			for (const selector of commonSelectors) {
+				const result = this.tryExtractWithSelector(doc, selector);
+				if (result.success && result.price !== null) {
+					return {
+						...result,
+						usedSelector: `common: ${selector}`,
+					};
+				}
+			}
 
-			// Try multiple methods to extract price text
-			let priceText = this.extractTextFromElement(element);
-			if (!priceText) return null;
+			// Last resort: search for price patterns in the entire document
+			const bodyText = doc.body ? doc.body.textContent || "" : "";
+			const fallbackResult = this.extractPriceFromText(bodyText);
+			if (fallbackResult.price !== null) {
+				return {
+					success: true,
+					price: fallbackResult.price,
+					extractedText: fallbackResult.extractedText,
+					usedSelector: "fallback: document scan",
+				};
+			}
 
-			// Clean and parse the price
-			const price = this.cleanAndParsePrice(priceText);
-			return price;
+			return {
+				success: false,
+				price: null,
+				error: "لم يتم العثور على سعر باستخدام أي من الطرق المتاحة",
+				extractedText: bodyText.substring(0, 200) + "...",
+			};
 		} catch (error) {
 			console.error("Error parsing HTML:", error);
-			return null;
+			return {
+				success: false,
+				price: null,
+				error: `خطأ في تحليل HTML: ${
+					error instanceof Error ? error.message : "خطأ غير معروف"
+				}`,
+			};
 		}
 	}
 
-	private extractTextFromElement(element: Element): string {
-		// Try different methods to extract price text
-		const methods = [
-			() => element.textContent || "",
-			() => element.getAttribute("content") || "",
-			() => element.getAttribute("data-price") || "",
-			() => element.getAttribute("value") || "",
-			() => element.getAttribute("title") || "",
-			() => element.getAttribute("aria-label") || "",
-			() => {
-				// Look for price in child elements
-				const priceElements = element.querySelectorAll(
-					'[class*="price"], [data-price], .amount, .cost'
-				);
-				return priceElements.length > 0
-					? priceElements[0].textContent || ""
-					: "";
-			},
-			() => {
-				// Look for numbers in any child text
-				const walker = document.createTreeWalker(
-					element,
-					NodeFilter.SHOW_TEXT,
-					null
-				);
-				let textNodes = [];
-				let node;
-				while ((node = walker.nextNode())) {
-					if (node.textContent && /[\d٠-٩]/.test(node.textContent)) {
-						textNodes.push(node.textContent);
+	private tryExtractWithSelector(
+		doc: Document,
+		selector: string
+	): {
+		success: boolean;
+		price: number | null;
+		extractedText?: string;
+	} {
+		try {
+			const elements = this.findElementsBySelector(doc, selector);
+
+			for (const element of elements) {
+				// Try multiple extraction methods for each element
+				const extractionMethods = [
+					() => this.extractFromAttributes(element),
+					() => this.extractFromTextContent(element),
+					() => this.extractFromChildElements(element),
+					() => this.extractFromSiblings(element),
+				];
+
+				for (const method of extractionMethods) {
+					const result = method();
+					if (result.price !== null) {
+						return {
+							success: true,
+							price: result.price,
+							extractedText: result.extractedText,
+						};
 					}
 				}
-				return textNodes.join(" ");
-			},
-		];
+			}
 
-		for (const method of methods) {
-			try {
-				const text = method().trim();
-				if (text && /[\d٠-٩]/.test(text)) {
-					return text;
-				}
-			} catch (e) {
-				continue;
+			return { success: false, price: null };
+		} catch (error) {
+			return { success: false, price: null };
+		}
+	}
+
+	private findElementsBySelector(doc: Document, selector: string): Element[] {
+		const elements: Element[] = [];
+
+		try {
+			// Try CSS selector first
+			const cssResults = doc.querySelectorAll(selector);
+			elements.push(...Array.from(cssResults));
+		} catch (e) {
+			// CSS selector failed, try alternative methods
+		}
+
+		// Try ID selector
+		if (selector.startsWith("#")) {
+			const element = doc.getElementById(selector.slice(1));
+			if (element && !elements.includes(element)) {
+				elements.push(element);
 			}
 		}
 
-		return "";
-	}
-
-	private cleanAndParsePrice(priceText: string): number | null {
-		if (!priceText) return null;
-
-		// Convert Arabic numerals to Western numerals
-		const arabicToWestern = {
-			"٠": "0",
-			"١": "1",
-			"٢": "2",
-			"٣": "3",
-			"٤": "4",
-			"٥": "5",
-			"٦": "6",
-			"٧": "7",
-			"٨": "8",
-			"٩": "9",
-		};
-
-		let cleanText = priceText;
-
-		// Replace Arabic numerals
-		for (const [arabic, western] of Object.entries(arabicToWestern)) {
-			cleanText = cleanText.replace(new RegExp(arabic, "g"), western);
+		// Try class selector
+		if (selector.startsWith(".")) {
+			const classElements = doc.getElementsByClassName(selector.slice(1));
+			Array.from(classElements).forEach((el) => {
+				if (!elements.includes(el)) elements.push(el);
+			});
 		}
 
-		// Remove common currency symbols and words
-		const currencyPatterns = [
-			/ر\.س/g,
-			/ريال/g,
-			/رس/g,
-			/SAR/g,
-			/SR/g,
-			/\$/g,
-			/USD/g,
-			/دولار/g,
-			/€/g,
-			/EUR/g,
-			/يورو/g,
-			/£/g,
-			/GBP/g,
-			/جنيه/g,
-			/د\.إ/g,
-			/درهم/g,
-			/AED/g,
-			/ج\.م/g,
-			/جنيه مصري/g,
-			/EGP/g,
-			/د\.ك/g,
-			/دينار/g,
-			/KWD/g,
-			/ل\.ل/g,
-			/ليرة/g,
-			/LBP/g,
-			/price/gi,
-			/السعر/g,
-			/سعر/g,
-			/من/g,
-			/إلى/g,
-			/starting/gi,
-			/from/gi,
-			/to/gi,
-		];
+		// Try tag selector
+		if (
+			!selector.includes(".") &&
+			!selector.includes("#") &&
+			!selector.includes("[")
+		) {
+			const tagElements = doc.getElementsByTagName(selector);
+			Array.from(tagElements).forEach((el) => {
+				if (!elements.includes(el)) elements.push(el);
+			});
+		}
 
-		currencyPatterns.forEach((pattern) => {
-			cleanText = cleanText.replace(pattern, " ");
-		});
+		// Try attribute-based search
+		if (selector.includes("[") && selector.includes("]")) {
+			const attrMatch = selector.match(/\[([^\]]+)\]/);
+			if (attrMatch) {
+				const attrQuery = attrMatch[1];
+				const allElements = doc.getElementsByTagName("*");
+				Array.from(allElements).forEach((el) => {
+					if (el.hasAttribute(attrQuery) && !elements.includes(el)) {
+						elements.push(el);
+					}
+				});
+			}
+		}
 
-		// Handle different decimal separators
-		// Arabic decimal separator ٫ and regular comma ,
-		// Also handle thousands separators
-		const priceNumbers = this.extractNumbersFromText(cleanText);
-
-		if (priceNumbers.length === 0) return null;
-
-		// Return the largest number found (likely the main price)
-		return Math.max(...priceNumbers);
+		return elements;
 	}
 
-	private extractNumbersFromText(text: string): number[] {
-		const numbers: number[] = [];
+	private extractFromAttributes(element: Element): {
+		price: number | null;
+		extractedText?: string;
+	} {
+		for (const attr of this.PRICE_ATTRIBUTES) {
+			const value = element.getAttribute(attr);
+			if (value) {
+				const price = this.parsePrice(value);
+				if (price !== null) {
+					return { price, extractedText: `[${attr}="${value}"]` };
+				}
+			}
+		}
+		return { price: null };
+	}
 
-		// Patterns to match different number formats
-		const patterns = [
-			// Standard formats: 1234.56, 1,234.56, 1 234.56
-			/\d{1,3}(?:[,\s]\d{3})*\.\d{2}/g,
-			// Arabic decimal: 1234٫56, 1,234٫56
-			/\d{1,3}(?:[,\s]\d{3})*٫\d{2}/g,
-			// Integers with thousands separators: 1,234 or 1 234
-			/\d{1,3}(?:[,\s]\d{3})+/g,
-			// Simple decimals: 123.45
-			/\d+\.\d+/g,
-			// Arabic decimals: 123٫45
-			/\d+٫\d+/g,
-			// Plain integers: 1234
-			/\d{3,}/g, // At least 3 digits to avoid false positives
-			// Any remaining digits (fallback)
-			/\d+/g,
+	private extractFromTextContent(element: Element): {
+		price: number | null;
+		extractedText?: string;
+	} {
+		const text = element.textContent || "";
+		const price = this.parsePrice(text);
+		if (price !== null) {
+			return { price, extractedText: text.trim() };
+		}
+		return { price: null };
+	}
+
+	private extractFromChildElements(element: Element): {
+		price: number | null;
+		extractedText?: string;
+	} {
+		// Look for price in child elements
+		const priceElements = element.querySelectorAll(
+			'[class*="price"], [class*="cost"], [class*="amount"], [data-price], .currency, .money, [class*="سعر"]'
+		);
+
+		for (const priceEl of Array.from(priceElements)) {
+			const text = priceEl.textContent || "";
+			const price = this.parsePrice(text);
+			if (price !== null) {
+				return { price, extractedText: text.trim() };
+			}
+
+			// Check attributes of child elements
+			const attrResult = this.extractFromAttributes(priceEl);
+			if (attrResult.price !== null) {
+				return attrResult;
+			}
+		}
+
+		return { price: null };
+	}
+
+	private extractFromSiblings(element: Element): {
+		price: number | null;
+		extractedText?: string;
+	} {
+		// Check siblings for price information
+		const siblings = [
+			element.previousElementSibling,
+			element.nextElementSibling,
 		];
 
-		for (const pattern of patterns) {
+		for (const sibling of siblings) {
+			if (sibling) {
+				const text = sibling.textContent || "";
+				const price = this.parsePrice(text);
+				if (price !== null) {
+					return { price, extractedText: text.trim() };
+				}
+			}
+		}
+
+		return { price: null };
+	}
+
+	private extractPriceFromText(text: string): {
+		price: number | null;
+		extractedText?: string;
+	} {
+		// Find all potential price matches
+		const prices: { price: number; text: string; confidence: number }[] =
+			[];
+
+		for (const pattern of this.PRICE_PATTERNS) {
 			const matches = text.match(pattern);
 			if (matches) {
 				for (const match of matches) {
-					const cleaned = this.normalizeNumber(match);
-					const num = parseFloat(cleaned);
-					if (!isNaN(num) && num > 0) {
-						numbers.push(num);
+					const price = this.parsePrice(match);
+					if (price !== null && price >= 0.01 && price <= 1000000) {
+						const confidence = this.calculatePriceConfidence(
+							match,
+							text
+						);
+						prices.push({ price, text: match, confidence });
 					}
 				}
-				// If we found numbers with this pattern, don't try simpler patterns
-				if (numbers.length > 0) break;
 			}
 		}
 
-		// Filter out unrealistic prices (too small or too large)
-		return numbers.filter((num) => num >= 0.01 && num <= 1000000);
+		if (prices.length === 0) {
+			return { price: null };
+		}
+
+		// Sort by confidence and return the best match
+		prices.sort((a, b) => b.confidence - a.confidence);
+		return {
+			price: prices[0].price,
+			extractedText: prices[0].text,
+		};
+	}
+
+	private calculatePriceConfidence(
+		priceText: string,
+		context: string
+	): number {
+		let confidence = 50; // Base confidence
+
+		// Increase confidence if surrounded by price-related words
+		const priceKeywords = [
+			"price",
+			"cost",
+			"amount",
+			"total",
+			"سعر",
+			"تكلفة",
+			"مبلغ",
+			"إجمالي",
+			"ريال",
+			"دولار",
+			"جنيه",
+			"درهم",
+			"دينار",
+			"ر.س",
+			"$",
+			"€",
+			"£",
+		];
+
+		const surroundingText = this.getSurroundingText(priceText, context, 50);
+		for (const keyword of priceKeywords) {
+			if (surroundingText.toLowerCase().includes(keyword.toLowerCase())) {
+				confidence += 15;
+			}
+		}
+
+		// Increase confidence for properly formatted prices
+		if (/\d{1,3}(,\d{3})*\.\d{2}/.test(priceText)) confidence += 20;
+		if (/\d+\.\d{2}$/.test(priceText)) confidence += 10;
+		if (priceText.length >= 4 && priceText.length <= 10) confidence += 10;
+
+		// Decrease confidence for very large or very small numbers
+		const numericValue = parseFloat(priceText.replace(/[^\d.]/g, ""));
+		if (numericValue < 1 || numericValue > 100000) confidence -= 20;
+
+		return Math.max(0, Math.min(100, confidence));
+	}
+
+	private getSurroundingText(
+		target: string,
+		fullText: string,
+		radius: number
+	): string {
+		const index = fullText.indexOf(target);
+		if (index === -1) return "";
+
+		const start = Math.max(0, index - radius);
+		const end = Math.min(fullText.length, index + target.length + radius);
+		return fullText.substring(start, end);
+	}
+
+	private getCommonPriceSelectors(): string[] {
+		return [
+			// Generic price selectors
+			".price",
+			"#price",
+			"[data-price]",
+			".amount",
+			".cost",
+			".price-now",
+			".current-price",
+			".sale-price",
+			".final-price",
+			".product-price",
+			".item-price",
+			".total-price",
+
+			// Amazon-specific
+			".a-price .a-offscreen",
+			".a-price-whole",
+			".a-price-range",
+			"#priceblock_dealprice",
+			"#priceblock_ourprice",
+			".a-price.a-text-price",
+
+			// Common Arabic e-commerce sites
+			".price",
+			".price-now",
+			".price-current",
+			".current-price",
+			".product-price",
+			".final-price",
+			".sale-price",
+
+			// General patterns
+			'[class*="price"]',
+			'[class*="cost"]',
+			'[class*="amount"]',
+			'[id*="price"]',
+			'[id*="cost"]',
+			'[id*="amount"]',
+			'span[class*="currency"]',
+			'div[class*="money"]',
+
+			// Fallback patterns
+			"span",
+			"div",
+			"p",
+			"strong",
+			"b",
+		];
+	}
+
+	private parsePrice(text: string): number | null {
+		if (!text || typeof text !== "string") return null;
+
+		// Convert Arabic numerals to Western
+		let cleanText = this.convertArabicNumerals(text);
+
+		// Remove common non-numeric characters but keep decimals and thousands separators
+		cleanText = cleanText.replace(/[^\d\.,٫\s]/g, " ");
+
+		// Extract potential price numbers using enhanced patterns
+		const prices: number[] = [];
+
+		for (const pattern of this.PRICE_PATTERNS) {
+			const matches = cleanText.match(pattern);
+			if (matches) {
+				for (const match of matches) {
+					const normalized = this.normalizeNumber(match.trim());
+					const num = parseFloat(normalized);
+					if (!isNaN(num) && num > 0 && num <= 1000000) {
+						prices.push(num);
+					}
+				}
+				// If we found valid prices with this pattern, use them
+				if (prices.length > 0) break;
+			}
+		}
+
+		if (prices.length === 0) return null;
+
+		// Return the most reasonable price (usually the largest one within reasonable bounds)
+		const reasonablePrices = prices.filter((p) => p >= 0.01 && p <= 100000);
+		if (reasonablePrices.length === 0) return null;
+
+		// If multiple prices, prefer the one that looks most like a retail price
+		if (reasonablePrices.length > 1) {
+			// Prefer prices with 2 decimal places or round numbers
+			const precisionPrices = reasonablePrices.filter(
+				(p) => p % 1 === 0 || (p * 100) % 1 === 0
+			);
+			if (precisionPrices.length > 0) {
+				return Math.max(...precisionPrices);
+			}
+		}
+
+		return Math.max(...reasonablePrices);
+	}
+
+	private convertArabicNumerals(text: string): string {
+		let result = text;
+		for (const [arabic, western] of Object.entries(this.ARABIC_NUMERALS)) {
+			result = result.replace(new RegExp(arabic, "g"), western);
+		}
+		return result;
 	}
 
 	private normalizeNumber(numberStr: string): string {
-		// Remove spaces used as thousands separators
-		let normalized = numberStr.replace(/\s/g, "");
+		if (!numberStr) return "0";
 
-		// Handle different decimal separator cases
+		// Remove extra spaces
+		let normalized = numberStr.replace(/\s+/g, "");
+
+		// Handle Arabic decimal separator
 		if (normalized.includes("٫")) {
-			// Arabic decimal separator
 			const parts = normalized.split("٫");
 			if (parts.length === 2) {
-				// Remove commas from integer part (thousands separator)
-				const intPart = parts[0].replace(/,/g, "");
+				const intPart = parts[0].replace(/[,\.]/g, "");
 				normalized = intPart + "." + parts[1];
 			}
-		} else if (normalized.includes(".") && normalized.includes(",")) {
-			// Both comma and dot - determine which is decimal separator
+		}
+		// Handle European format (comma as decimal)
+		else if (normalized.match(/^\d{1,3}(\.\d{3})*,\d{2}$/)) {
+			normalized = normalized.replace(/\./g, "").replace(",", ".");
+		}
+		// Handle US format (comma as thousands separator)
+		else if (normalized.match(/^\d{1,3}(,\d{3})*(\.\d{2})?$/)) {
+			normalized = normalized.replace(/,/g, "");
+		}
+		// Handle space as thousands separator
+		else if (normalized.match(/^\d{1,3}(\s\d{3})*([,\.]\d{2})?$/)) {
+			normalized = normalized.replace(/\s/g, "").replace(",", ".");
+		}
+		// Handle mixed separators - determine decimal separator by position
+		else if (normalized.includes(",") && normalized.includes(".")) {
 			const lastComma = normalized.lastIndexOf(",");
 			const lastDot = normalized.lastIndexOf(".");
 
 			if (lastDot > lastComma) {
-				// Dot is decimal separator, comma is thousands
+				// Dot is decimal separator
 				normalized = normalized.replace(/,/g, "");
 			} else {
-				// Comma is decimal separator, dot is thousands
+				// Comma is decimal separator
 				normalized = normalized.replace(/\./g, "").replace(",", ".");
 			}
-		} else if (normalized.includes(",")) {
-			// Only comma - could be thousands or decimal separator
+		}
+		// Single comma - check if it's decimal or thousands
+		else if (normalized.includes(",") && !normalized.includes(".")) {
 			const commaIndex = normalized.lastIndexOf(",");
 			const afterComma = normalized.substring(commaIndex + 1);
 
@@ -432,6 +798,22 @@ export class PriceService {
 
 		return normalized;
 	}
+
+	private getRandomUserAgent(): string {
+		const userAgents = [
+			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+			"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/120.0.0.0",
+			"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+			"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+		];
+		return userAgents[Math.floor(Math.random() * userAgents.length)];
+	}
+
+	// [Rest of the class methods remain the same as in the original code]
+	// checkPriceAlerts, addPriceAlert, removePriceAlert, togglePriceAlert,
+	// getPriceComparison, getPriceHistory, getPriceStatistics,
+	// manualPriceUpdate, getBuyingRecommendation
 
 	private async checkPriceAlerts(
 		item: ShoppingItem,
