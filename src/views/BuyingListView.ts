@@ -25,6 +25,7 @@ import {
 	WebsiteEmbedModal,
 } from "../components/WebsiteModals";
 import BuyingListPlugin from "../../main";
+import { ItemWebsitesComparisonModal } from "src/components/ItemWebsitesComparisonModal";
 
 export const VIEW_TYPE_BUYING_LIST = "buying-list-view";
 
@@ -482,7 +483,6 @@ export class BuyingListView extends ItemView {
 			attr: { title: "حذف العنصر" },
 		});
 		deleteButton.onclick = () => this.deleteItem(item.id);
-
 		// Item body
 		const itemBody = itemCard.createDiv("item-body");
 
@@ -530,6 +530,10 @@ export class BuyingListView extends ItemView {
 		}
 	}
 
+	private openWebsitesComparison(item: ShoppingItem): void {
+		new ItemWebsitesComparisonModal(this.app, this.plugin, item).open();
+	}
+
 	private createWebsitesSection(
 		container: HTMLElement,
 		item: ShoppingItem
@@ -540,6 +544,16 @@ export class BuyingListView extends ItemView {
 		websitesHeader.createEl("h4", { text: "المواقع والأسعار" });
 
 		const headerActions = websitesHeader.createDiv("header-actions");
+
+		// Compare all websites button (NEW)
+		if (item.websites.length > 1) {
+			const compareAllButton = headerActions.createEl("button", {
+				text: "🔍 مقارنة",
+				cls: "compare-all-btn",
+				attr: { title: "عرض جميع المواقع جنباً إلى جنب" },
+			});
+			compareAllButton.onclick = () => this.openWebsitesComparison(item);
+		}
 
 		const addWebsiteButton = headerActions.createEl("button", {
 			text: "+ موقع",
